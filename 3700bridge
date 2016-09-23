@@ -1,0 +1,179 @@
+#!/usr/bin/python -u    
+# The -u makes output unbuffered, so it will show up immediately
+import sys
+import socket
+import json
+import select
+from time import sleep
+from random import uniform
+
+
+# pads the name with null bytes at the end
+def pad(name):
+    result = '\0' + name
+    while len(result) < 108:
+        result += '\0'
+    return result
+
+
+
+class Port:
+    def __init__(self, id, socket):
+        self.id = id  # just a random unique id and is only relevant within this bridge
+        self.socket = socket
+        # until we hear about a Bridge that is better, we will assume we are the best for every host on this port
+        self.isDesignatedPort = True
+        self.disabled = False
+        self.has_recieved_bpdu = False  # used for calculating if port should be disabled
+
+    def send_packet(self, packet):
+        packetString = json.dumps(packet)
+
+        try:
+            self.socket.sendall(packetString)
+        except Exception as e:
+            print("Error sending message: on port " + str(self.id) + str(e))
+
+    def read(self):
+        try:
+            return json.loads(self.socket.recv(1024))
+        except Exception as e:
+            print('Error while reading from port' + " on port " + self.id + str(e))
+
+
+class Bridge:
+    def __init__(self, id_in_hex, LAN):
+        print("Bridge " + id_in_hex + " starting up\n")
+
+        self.id_in_hex = id_in_hex
+        self.LAN = list(set(LAN)) #because you guys are trolling us and giving duplicate LAN IDs
+        print (self.LAN)
+        self.rootID_hex = id_in_hex  # initially we always assume we are the root
+        self.minCostToRoot = 0
+        self.ports = []  # holds instances of the Port class
+        self.rootPortID = None #the root's (us initially) rootPortID will be None
+        self.poll = select.poll() #used to read from our sockets in a single threaded manner
+        self.sockets = [] #initally we have none
+
+        # creates sockets and connects to them
+        for x in range(len(self.LAN)):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            s.setblocking(0)
+            s.connect(pad(self.LAN[x]))
+            port = Port(id=x, socket=s) #so ports will be ID'ed 0,1,2,3..
+            self.ports.append(port)
+            self.poll.register(s)
+            self.sockets.append(s)
+
+        #using the select module means we work with sockets but we need to store extra state
+        #using the Port class, this is to map sockets to their ports which contains more information
+        self.socket_fileno_to_port = {port.socket.fileno(): port for port in self.ports}
+
+    #override sends to all ports, even disabled ones
+    def _send_packet_to_all(self, packet, override = False):
+        for p in self.ports:
+            if not p.disabled or override:
+                #print("Sending the following packet on all ports: {}".format(packet))
+                p.send_packet(packet=packet)
+
+    def _broadcast_bpdu(self):
+        # uses current stored root info to broadcast bpdu on all ports
+        bpdu = {
+            "source": self.id_in_hex,
+            "dest": "ffff",  # every bpdu is a broadcast
+            "type": "bpdu",
+            "message": {
+                "id": self.id_in_hex,
+                "root": self.rootID_hex,
+                "cost": self.minCostToRoot
+            }
+        }
+
+        self._send_packet_to_all(bpdu, override=True) #BPDU's must be sent to all ports so we override
+
+    def loop(self):
+        while True:
+            self._broadcast_bpdu()
+
+            ready_socks, _, _ = select.select(self.sockets, [], [], 1)
+            for sock in ready_socks:
+                port = self.socket_fileno_to_port.get(sock.fileno())
+                msg = port.read()
+                if msg.get('type') == 'bpdu':
+                    port.has_recieved_bpdu = True
+                    self.handle_bpdu(msg, port)
+                elif msg.get('type') == 'data':
+                    please = True
+                    #print('dropping host packet')
+                else:
+                    print("WEIRD SHIT LOOK: " + str(msg))
+
+            sleep(uniform(.1, .5))
+
+    def handle_bpdu(self, msg, port):
+        rootData = msg.get('message')
+        otherCost = int(rootData.get('cost'))
+        otherRoot_hex = rootData.get('root')
+        otherID_hex = rootData.get('id')
+
+        otherRoot_int = int(otherRoot_hex, 16)
+        otherID_int = int(otherID_hex, 16)
+        ourRoot_int = int(self.rootID_hex, 16)
+        ourID_int = int(self.id_in_hex, 16)
+
+        potential_new_cost = otherCost + 1 #if we use their root, we will need 1 hop extra to get to them
+
+        useOtherRoot = False
+
+        if otherRoot_int < ourRoot_int:
+            #by definition, we agree lowest id is root
+            useOtherRoot = True
+        elif otherRoot_int == ourRoot_int and potential_new_cost < self.minCostToRoot:
+            #or they have a faster path to same root
+            useOtherRoot = True
+        elif otherRoot_int == ourRoot_int and potential_new_cost == self.minCostToRoot and otherID_int < ourID_int\
+                and not otherID_hex == self.rootID_hex:
+            #or they have same root and cost and a lower bridge ID
+            useOtherRoot = True
+
+
+        if useOtherRoot:
+            self.rootID_hex = otherRoot_hex
+            self.minCostToRoot = potential_new_cost
+            print("New root: {}:{}/{}".format(self.id_in_hex, self.rootID_hex, self.minCostToRoot))
+            self._broadcast_bpdu()
+
+            self.rootPortID = port.id
+            print("Root port: {}/{}".format(self.id_in_hex, self.rootPortID))
+
+        #if otherCost <= self.minCostToRoot and otherID_int < ourID_int:
+            #port.isDesignatedPort = False
+
+        #self.check_ports()
+
+    def disable_port(self, portID):
+        for p in self.ports:
+            if p.id == portID and not p.disabled:
+                print("Disabled port: {}/{}".format(self.id_in_hex, portID))
+                p.disabled = True
+
+    def enable_port(self, portID):
+        for p in self.ports:
+            if p.id == portID and p.disabled:
+                print("Enabled port: {}/{}".format(self.id_in_hex, portID))
+                p.disabled = False
+
+    def check_ports(self):
+        for port in self.ports:
+            if port.has_recieved_bpdu or port.id == self.rootPortID or port.isDesignatedPort:
+                self.enable_port(port.id)
+            else:
+                self.disable_port(port.id)
+
+
+if __name__ == "__main__":
+    id_in_hex = sys.argv[1]
+    LAN = sys.argv[2:]
+
+    bridge = Bridge(id_in_hex=id_in_hex, LAN=LAN)
+    bridge.loop()
